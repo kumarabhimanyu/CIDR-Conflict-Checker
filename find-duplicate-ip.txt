@@ -1,0 +1,183 @@
+# ============================================
+# Function: Get-CIDRRange
+# Purpose: Converts a CIDR to start and end IPs as unsigned integers.
+# ============================================
+function Get-CIDRRange {
+    param ([string]$CIDR)
+
+    $split = $CIDR -split "/"
+    $ip = [System.Net.IPAddress]::Parse($split[0]).GetAddressBytes()  # Convert IP string to byte array
+    $prefix = [int]$split[1]  # Convert prefix length to integer
+
+    # Convert IP address to a 32-bit unsigned integer
+    $ipInt = ([uint64]$ip[0] -shl 24) -bor
+             ([uint64]$ip[1] -shl 16) -bor
+             ([uint64]$ip[2] -shl 8) -bor
+             ([uint64]$ip[3])
+
+    # Calculate the number of IPs in the CIDR block
+    $rangeSize = [uint64]1
+    $rangeSize = $rangeSize -shl (32 - $prefix)
+
+    # Determine the start and end IPs in the range
+    $startIP = $ipInt
+    $endIP = $startIP + $rangeSize - 1
+
+    return @{ Start = $startIP; End = $endIP }  # Return as a hashtable
+}
+
+# ============================================
+# Function: Get-CIDRClass
+# Purpose: Determines the IP class (A, B, C) based on the first octet.
+# ============================================
+function Get-CIDRClass {
+    param ([string]$CIDR)
+
+    $ipPart = ($CIDR -split "/")[0]  # Extract IP part from CIDR
+    $octets = $ipPart -split "\."  # Split IP into octets
+    $firstOctet = [int]$octets[0]  # Convert first octet to integer
+
+    # Determine class based on first octet range
+    if ($firstOctet -ge 1 -and $firstOctet -le 126) { return "A" }
+    elseif ($firstOctet -ge 128 -and $firstOctet -le 191) { return "B" }
+    elseif ($firstOctet -ge 192 -and $firstOctet -le 223) { return "C" }
+    else { return "Other" }
+}
+
+# ============================================
+# Function: Ranges-Overlap
+# Purpose: Checks if two IP ranges overlap.
+# ============================================
+function Ranges-Overlap {
+    param (
+        [uint64]$start1, [uint64]$end1,
+        [uint64]$start2, [uint64]$end2
+    )
+
+    # Return true if ranges intersect
+    return ($start1 -le $end2 -and $end1 -ge $start2)
+}
+
+# ============================================
+# Function: Validate-InputFile
+# Purpose: Validates file extension and column names
+# ============================================
+function Validate-InputFile {
+    param ([string]$FilePath)
+
+    # Check if file exists
+    if (-not (Test-Path $FilePath)) {
+        Write-Error "File does not exist: $FilePath"
+        exit
+    }
+
+    # Ensure file is a CSV
+    if ([System.IO.Path]::GetExtension($FilePath).ToLower() -ne ".csv") {
+        Write-Error "Invalid file type. Only .csv files are allowed."
+        exit
+    }
+
+    # Try to read the CSV file
+    try {
+        $sample = Import-Csv -Path $FilePath -Delimiter ',' -ErrorAction Stop
+    } catch {
+        Write-Error "Failed to read CSV file: $_"
+        exit
+    }
+
+    # Validate column names
+    $expectedColumns = @("CIDR1", "CIDR2")
+    $actualColumns = $sample[0].PSObject.Properties.Name
+
+    if ($actualColumns.Count -ne 2 -or ($expectedColumns | Where-Object { $_ -notin $actualColumns })) {
+        Write-Error "CSV must contain exactly two columns: CIDR1 and CIDR2."
+        exit
+    }
+}
+
+# ============================================
+# Function: Process-CIDRConflicts
+# Purpose: Compares each CIDR1 with all CIDR2s and logs overlaps.
+# ============================================
+function Process-CIDRConflicts {
+    param (
+        [string]$InputFile,
+        [string]$OutputFile,
+        [string]$ErrorLogFile
+    )
+
+    $rows = Import-Csv -Path $InputFile  # Read input CSV
+    $outputData = @()  # Initialize output array
+    $errorLog = @()  # Initialize error log
+
+    $targetCIDRMap = @{}  # Cache for CIDR2 ranges
+    foreach ($row in $rows) {
+        $cidr2 = $row.'CIDR2'
+        if (-not $targetCIDRMap.ContainsKey($cidr2)) {
+            try {
+                $targetCIDRMap[$cidr2] = Get-CIDRRange -CIDR $cidr2
+            } catch {
+                $targetCIDRMap[$cidr2] = $null  # Mark invalid CIDR2
+            }
+        }
+    }
+
+    foreach ($row in $rows) {
+        $cidr1 = $row.'CIDR1'
+        $conflictingCIDRs = @()
+
+        try {
+            $range1 = Get-CIDRRange -CIDR $cidr1  # Get range for CIDR1
+
+            foreach ($cidr2 in $targetCIDRMap.Keys) {
+                $range2 = $targetCIDRMap[$cidr2]
+
+                # Check if range2 is valid and overlaps with range1
+                # If the start of range1 is before or at the end of range2
+                # and the end of range1 is after or at the start of range2,
+                # then the ranges overlap.
+                # Example: CIDR1 = 192.168.1.0/24, CIDR2 = 192.168.1.128/25 -> overlap
+
+                if ($range2 -ne $null -and (Ranges-Overlap -start1 $range1.Start -end1 $range1.End -start2 $range2.Start -end2 $range2.End)) {
+                    $conflictingCIDRs += $cidr2
+                }
+            }
+
+            $isConflict = $conflictingCIDRs.Count -gt 0
+            $conflictingCIDRsString = ($conflictingCIDRs | Sort-Object -Unique) -join ","
+
+            # Add result to output
+            $outputData += [PSCustomObject]@{
+                'source CIDR'       = $cidr1
+                'isConflict'        = $isConflict
+                'conflicting CIDRs' = $conflictingCIDRsString
+            }
+
+            Write-Host "Processed: $cidr1 - Conflict: $isConflict"
+
+        } catch {
+            # Log errors for invalid CIDR1
+            $errorLog += [PSCustomObject]@{
+                'source CIDR' = $cidr1
+                'error'       = $_.Exception.Message
+            }
+            Write-Host "Error processing $cidr1"
+        }
+    }
+
+    # Export results and errors
+    $outputData | Export-Csv -Path $OutputFile -NoTypeInformation
+    $errorLog | Export-Csv -Path $ErrorLogFile -NoTypeInformation
+}
+
+# ============================================
+# Main Execution
+# ============================================
+$inputFile = Read-Host "Enter the path to your input CSV file"
+Validate-InputFile -FilePath $inputFile  # Validate input file
+
+$outputFile = "output.csv"
+$errorLogFile = "error_log.csv"
+
+# Process the CIDR conflicts and generate output
+Process-CIDRConflicts -InputFile $inputFile -OutputFile $outputFile -ErrorLogFile $errorLogFile
