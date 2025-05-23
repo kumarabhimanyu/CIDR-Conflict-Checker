@@ -10,18 +10,6 @@ In hybrid and multi-cloud environments, overlapping IP ranges between on-premise
 ## Business Value
 This script automates the detection of IP conflicts between CIDR ranges, ensuring clean network segmentation across environments. It improves migration readiness, reduces risk of outages, and saves time by validating input structure and logging errors for traceability.
 
-## Tags
-- CIDR
-- IP conflict
-- PowerShell
-- Cloud migration
-- Network validation
-- Automation
-- CSV processing
-- Infrastructure
-- On-premises
-- Multi-cloud
-
 ## Usage Instructions
 
 1. **Place the Script and CSV File**: Ensure the PowerShell script and the input CSV file are in the same directory. The CSV file should have two columns: `CIDR1` and `CIDR2`.
